@@ -4,7 +4,6 @@
 #include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/events/EventBus.hpp>
 #include "core/memory/Hooks.hpp"
-#include <pl/memory/Vtable.hpp>
 #include <android/log.h>
 #include <cstdio>
 #include <cstring>
@@ -17,21 +16,74 @@ static BubbleChatModule* g_bubbleChatMod = nullptr;
 
 static void (*originalHandleText)(void*, void*, void*) = nullptr;
 
-// NameTagRenderer::render — vtable slot 17.
-// Signature: void render(void* self, void* uiRenderContext, void* uiControl, void* uiAnchor)
-static void (*s_nameTagRenderOrig)(void*, void*, void*, void*) = nullptr;
-static int s_hookFireLogBudget = 8;  // rate-limit the diagnostic logs
+// BaseActorRenderer::renderText — the REAL world nametag render (tessellator
+// panel + text). Signature (best effort): (x0=ctx, x1=screenCtx, x2=data,
+// x3=text, x4=color). Found via signature, verified unique.
+static void (*s_renderTextOrig)(void*, void*, void*, void*, void*) = nullptr;
+static int s_renderTextLogBudget = 40;  // rate-limit diagnostic logs
 
-static void nameTagRenderHook(void* self, void* uiCtx, void* uiControl, void* uiAnchor) {
-    if (s_nameTagRenderOrig) s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
+static void writeDiag(const char* fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, "BubbleChat", "%s", buf);
 
-    if (g_bubbleChatMod && g_bubbleChatMod->enabled && g_bubbleChatMod->m_separateBubble) {
-        if (s_hookFireLogBudget > 0) {
-            --s_hookFireLogBudget;
-            BT_LOG("render hook fired (self=%p)", self);
-        }
-        g_bubbleChatMod->renderSeparateBubble(self, uiCtx, uiControl, uiAnchor);
+    // Also dump to a file the user can open directly (no logcat needed).
+    FILE* fp = fopen("/storage/emulated/0/Android/media/org.levimc.launcher/kurumi/bubblechat_diag.log", "a");
+    if (fp) {
+        fprintf(fp, "%s\n", buf);
+        fclose(fp);
     }
+}
+
+static void renderTextHook(void* x0, void* x1, void* x2, void* x3, void* x4) {
+    if (s_renderTextLogBudget > 0) {
+        --s_renderTextLogBudget;
+        writeDiag("renderText fired: x0=%p x1=%p x2=%p x3=%p x4=%p",
+                  x0, x1, x2, x3, x4);
+
+        // Try to read a string from x2 and x3 (could be std::string or raw ptr).
+        auto tryStr = [](void* p) -> const char* {
+            if (!p || (uintptr_t)p < 0x1000) return nullptr;
+            // Try: p is a pointer to a C-string.
+            return reinterpret_cast<const char*>(p);
+        };
+        // x3 is most likely the text (from draw-text: x2=strPtr came from arg3 path)
+        for (int slot = 2; slot <= 3; ++slot) {
+            void* arg = (slot == 2) ? x2 : x3;
+            if (!arg || (uintptr_t)arg < 0x1000) continue;
+            // Read as std::string-like: pointer at +0 (heap) or inline at +1
+            char tmp[96];
+            memset(tmp, 0, sizeof(tmp));
+            // heap layout: [ptr][size][cap]
+            const char* dataPtr = *reinterpret_cast<const char* const*>(arg);
+            if (dataPtr && (uintptr_t)dataPtr > 0x1000) {
+                strncpy(tmp, dataPtr, sizeof(tmp) - 1);
+                writeDiag("  arg x%d -> heap string: '%s'", slot, tmp);
+            }
+            // inline layout (SSO): bytes right after the size field
+            bool printable = true;
+            size_t n = 0;
+            const unsigned char* b = reinterpret_cast<const unsigned char*>(arg);
+            for (size_t i = 0; i < 48; ++i) {
+                if (b[i] == 0) { n = i; break; }
+                if (b[i] < 0x20 || b[i] > 0x7e) { printable = false; break; }
+            }
+            if (printable && n > 0) {
+                strncpy(tmp, reinterpret_cast<const char*>(arg), n);
+                writeDiag("  arg x%d -> inline string: '%s'", slot, tmp);
+            }
+        }
+        // x4 = color (4 floats).
+        if (x4 && (uintptr_t)x4 > 0x1000) {
+            const float* c = reinterpret_cast<const float*>(x4);
+            writeDiag("  color @x4: %.2f %.2f %.2f %.2f", c[0], c[1], c[2], c[3]);
+        }
+    }
+
+    if (s_renderTextOrig) s_renderTextOrig(x0, x1, x2, x3, x4);
 }
 
 struct DistanceSortedActor { void* mActor; float mDistance; float _pad; };
@@ -302,25 +354,17 @@ void BubbleChatModule::onInit() {
     if (auto aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer)) s_actorIsPlayer = (ActorIsPlayerFn)aip;
     if (auto snt = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)) s_actorSetNameTag = (ActorSetNameTagFn)snt;
 
-    // Install the NameTagRenderer::render hook for the separate-bubble mode.
-    if (!s_nameTagRenderOrig) {
-        void* target = nullptr;
-
-        // 1) Byte-signature first (verified unique against 26.40).
-        const auto sig = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::NameTagRendererRender);
-        if (sig) { target = reinterpret_cast<void*>(sig); BT_LOG("hook target via SIGNATURE = 0x%llx", (unsigned long long)sig); }
-
-        // 2) RTTI vtable resolution as fallback.
-        if (!target) {
-            const auto vt = pl::memory::resolveVtableFunction("15NameTagRenderer", 17, "libminecraftpe.so");
-            if (vt) { target = reinterpret_cast<void*>(vt); BT_LOG("hook target via VTABLE = 0x%llx", (unsigned long long)vt); }
-        }
-
-        if (target) {
-            bedrocktools::hooks::install(target, reinterpret_cast<void*>(nameTagRenderHook), reinterpret_cast<void**>(&s_nameTagRenderOrig));
-            BT_LOG("render hook installed=%d", s_nameTagRenderOrig != nullptr);
+    // Diagnostic hook on the REAL world nametag render (BaseActorRenderer::renderText).
+    if (!s_renderTextOrig) {
+        const auto sig = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::BaseActorRenderText);
+        if (sig) {
+            bedrocktools::hooks::install(reinterpret_cast<void*>(sig),
+                                         reinterpret_cast<void*>(renderTextHook),
+                                         reinterpret_cast<void**>(&s_renderTextOrig));
+            writeDiag("renderText hook INSTALLED at 0x%llx (orig=%p)",
+                      (unsigned long long)sig, (void*)s_renderTextOrig);
         } else {
-            BT_LOG("render hook FAILED: no signature and no vtable resolution");
+            writeDiag("renderText hook FAILED: signature not resolved");
         }
     }
 
@@ -329,74 +373,10 @@ void BubbleChatModule::onInit() {
     });
 }
 
-void BubbleChatModule::renderSeparateBubble(void* self, void* uiCtx, void* uiControl, void* uiAnchor) {
-    if (!self || !uiAnchor || !s_nameTagRenderOrig) return;
-
-    try {
-        std::string* pText = reinterpret_cast<std::string*>(reinterpret_cast<std::uintptr_t>(self) + 0x28);
-        if (!pText || pText->empty()) return;
-
-        const std::string playerName = stripColors(*pText);
-        if (playerName.empty()) return;
-
-        // Match the drawn nametag (player name) against a pending-bubble author.
-        std::string foundKey;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_bubbles.find(playerName);
-            if (it != m_bubbles.end()) {
-                foundKey = playerName;
-            } else {
-                const std::string norm = normalizeName(playerName);
-                for (const auto& kv : m_bubbles) {
-                    if (normalizeName(kv.first) == norm) { foundKey = kv.first; break; }
-                }
-            }
-        }
-        if (foundKey.empty()) return;
-
-        std::string joined;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_bubbles.find(foundKey);
-            if (it == m_bubbles.end() || it->second.empty()) return;
-            for (const auto& b : it->second) {
-                if (!joined.empty()) joined += "\n";
-                joined += wrapText(stripColors(b.message), 28);
-            }
-        }
-        if (joined.empty()) return;
-
-        // Lift the anchor and swap the text, then re-render to draw a second
-        // nametag-style box (the message) above the original one.
-        float* pos = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(uiAnchor) + 0x10);
-        float* size = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(uiAnchor) + 0x40);
-        const float boxH = (size[1] > 1.0f) ? size[1] : 20.0f;
-        const float gap = 4.0f;
-
-        const std::string original = *pText;
-        const float origY = pos[1];
-
-        *pText = joined;
-        pos[1] = origY - (boxH + gap);
-
-        s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
-
-        pos[1] = origY;
-        *pText = original;
-    } catch (...) {
-        // Never crash the game on a rendering edge case.
-    }
-}
-
 void BubbleChatModule::applyBubbles(bool apply) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     if (!apply) m_bubbles.clear();
-
-    // In separate-bubble mode the message is drawn by the NameTagRenderer hook,
-    // not by overriding the nametag text.
-    if (m_separateBubble) return;
 
     if (m_bubbles.empty() && m_overrides.empty()) return;
     if (!m_localPlayerPtr || !s_actorFetchNearby || !s_actorSetNameTag) return;
@@ -454,8 +434,7 @@ void BubbleChatModule::applyBubbles(bool apply) {
         }
 
         if (bIt != m_bubbles.end()) {
-            // The nametag BECOMES the message (no name prefix), stacked with
-            // newlines. Colors stripped so text is plain.
+            // Default mode: the nametag becomes the message (stacked, newlines).
             std::string joined;
             for (const auto& b : bIt->second) {
                 if (!joined.empty()) joined += "\n";

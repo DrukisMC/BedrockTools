@@ -129,7 +129,7 @@ enum class SignatureId : std::uint16_t {
     BlockOccluderUpdateRenderFace,
     ItemInHandRendererRenderFirstPerson,
     MobGetModifiedSwingDuration,
-    NameTagRendererRender,
+    BaseActorRenderText,
     Count
 };
 
