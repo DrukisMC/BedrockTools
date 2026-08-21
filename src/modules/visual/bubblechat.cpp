@@ -4,87 +4,14 @@
 #include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/events/EventBus.hpp>
 #include "core/memory/Hooks.hpp"
-#include <android/log.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
 
-#define BT_LOG(...) __android_log_print(ANDROID_LOG_INFO, "BubbleChat", __VA_ARGS__)
-
 static BubbleChatModule* g_bubbleChatMod = nullptr;
 
 static void (*originalHandleText)(void*, void*, void*) = nullptr;
-
-// BaseActorRenderer::renderText — the REAL world nametag render (tessellator
-// panel + text). Signature (best effort): (x0=ctx, x1=screenCtx, x2=data,
-// x3=text, x4=color). Found via signature, verified unique.
-static void (*s_renderTextOrig)(void*, void*, void*, void*, void*) = nullptr;
-static int s_renderTextLogBudget = 40;  // rate-limit diagnostic logs
-
-static void writeDiag(const char* fmt, ...) {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    __android_log_print(ANDROID_LOG_INFO, "BubbleChat", "%s", buf);
-
-    // Also dump to a file the user can open directly (no logcat needed).
-    FILE* fp = fopen("/storage/emulated/0/Android/media/org.levimc.launcher/kurumi/bubblechat_diag.log", "a");
-    if (fp) {
-        fprintf(fp, "%s\n", buf);
-        fclose(fp);
-    }
-}
-
-static void renderTextHook(void* x0, void* x1, void* x2, void* x3, void* x4) {
-    if (s_renderTextLogBudget > 0) {
-        --s_renderTextLogBudget;
-        writeDiag("renderText fired: x0=%p x1=%p x2=%p x3=%p x4=%p",
-                  x0, x1, x2, x3, x4);
-
-        // Try to read a string from x2 and x3 (could be std::string or raw ptr).
-        auto tryStr = [](void* p) -> const char* {
-            if (!p || (uintptr_t)p < 0x1000) return nullptr;
-            // Try: p is a pointer to a C-string.
-            return reinterpret_cast<const char*>(p);
-        };
-        // x3 is most likely the text (from draw-text: x2=strPtr came from arg3 path)
-        for (int slot = 2; slot <= 3; ++slot) {
-            void* arg = (slot == 2) ? x2 : x3;
-            if (!arg || (uintptr_t)arg < 0x1000) continue;
-            // Read as std::string-like: pointer at +0 (heap) or inline at +1
-            char tmp[96];
-            memset(tmp, 0, sizeof(tmp));
-            // heap layout: [ptr][size][cap]
-            const char* dataPtr = *reinterpret_cast<const char* const*>(arg);
-            if (dataPtr && (uintptr_t)dataPtr > 0x1000) {
-                strncpy(tmp, dataPtr, sizeof(tmp) - 1);
-                writeDiag("  arg x%d -> heap string: '%s'", slot, tmp);
-            }
-            // inline layout (SSO): bytes right after the size field
-            bool printable = true;
-            size_t n = 0;
-            const unsigned char* b = reinterpret_cast<const unsigned char*>(arg);
-            for (size_t i = 0; i < 48; ++i) {
-                if (b[i] == 0) { n = i; break; }
-                if (b[i] < 0x20 || b[i] > 0x7e) { printable = false; break; }
-            }
-            if (printable && n > 0) {
-                strncpy(tmp, reinterpret_cast<const char*>(arg), n);
-                writeDiag("  arg x%d -> inline string: '%s'", slot, tmp);
-            }
-        }
-        // x4 = color (4 floats).
-        if (x4 && (uintptr_t)x4 > 0x1000) {
-            const float* c = reinterpret_cast<const float*>(x4);
-            writeDiag("  color @x4: %.2f %.2f %.2f %.2f", c[0], c[1], c[2], c[3]);
-        }
-    }
-
-    if (s_renderTextOrig) s_renderTextOrig(x0, x1, x2, x3, x4);
-}
 
 struct DistanceSortedActor { void* mActor; float mDistance; float _pad; };
 struct ActorVec { DistanceSortedActor* begin; DistanceSortedActor* end; DistanceSortedActor* cap; };
@@ -274,13 +201,11 @@ void BubbleChatModule::setDuration(int secs) {
 void BubbleChatModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
     if (j.contains("duration")) { int d = j.value("duration", 5); if (d < 1) d = 1; if (d > 15) d = 15; m_duration = d; }
-    if (j.contains("separateBubble")) m_separateBubble = j.value("separateBubble", false);
 }
 
 void BubbleChatModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
     j["duration"] = m_duration;
-    j["separateBubble"] = m_separateBubble;
 }
 
 void BubbleChatModule::addBubble(const std::string& author, const std::string& message) {
@@ -353,20 +278,6 @@ void BubbleChatModule::onInit() {
     if (auto afn = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorFetchNearbyActorsSorted)) s_actorFetchNearby = (ActorFetchFn)afn;
     if (auto aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer)) s_actorIsPlayer = (ActorIsPlayerFn)aip;
     if (auto snt = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)) s_actorSetNameTag = (ActorSetNameTagFn)snt;
-
-    // Diagnostic hook on the REAL world nametag render (BaseActorRenderer::renderText).
-    if (!s_renderTextOrig) {
-        const auto sig = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::BaseActorRenderText);
-        if (sig) {
-            bedrocktools::hooks::install(reinterpret_cast<void*>(sig),
-                                         reinterpret_cast<void*>(renderTextHook),
-                                         reinterpret_cast<void**>(&s_renderTextOrig));
-            writeDiag("renderText hook INSTALLED at 0x%llx (orig=%p)",
-                      (unsigned long long)sig, (void*)s_renderTextOrig);
-        } else {
-            writeDiag("renderText hook FAILED: signature not resolved");
-        }
-    }
 
     bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>([](const bedrocktools::events::LocalPlayerTickEvent& event) {
         tickCallback(event.player);

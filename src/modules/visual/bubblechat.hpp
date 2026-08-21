@@ -33,7 +33,6 @@ public:
     std::unordered_map<std::string, std::deque<Bubble>> m_bubbles;
     std::mutex m_mutex;
     int m_duration = 5;
-    bool m_separateBubble = false;
 
 private:
     struct Override { std::string original; std::string applied; };
