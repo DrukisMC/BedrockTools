@@ -10,7 +10,7 @@
 
 #include "cameraoverhaul.hpp"
 
-#include <bedrocktools/core/Hooks.hpp>
+#include "core/memory/Hooks.hpp"
 #include <bedrocktools/events/EventBus.hpp>
 #include <bedrocktools/events/LocalPlayerTickEvent.hpp>
 #include <bedrocktools/memory/Signatures.hpp>
