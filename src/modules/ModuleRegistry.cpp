@@ -1,4 +1,5 @@
 #include "ModuleRegistry.hpp"
+#include "visual/cameraoverhaul.hpp"
 #include "visual/fullbright.hpp"
 #include "visual/motionblur.hpp"
 #include "visual/fpsunlocker.hpp"
@@ -121,4 +122,5 @@ void registerAllModules() {
     registry.emplace<ConnectedGlassModule>();
     registry.emplace<ForceGlobalRPModule>();
     registry.emplace<BubbleChatModule>();
+    registry.emplace<CameraOverhaulModule>();
 }
