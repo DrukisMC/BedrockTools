@@ -1,187 +1,377 @@
 #include "bubblechat.hpp"
-
-#include "core/memory/Hooks.hpp"
 #include <bedrocktools/memory/Signatures.hpp>
-#include <bedrocktools/sdk/client/ClientInstance.hpp>
-#include <bedrocktools/sdk/world/Actor.hpp>
+#include <bedrocktools/sdk/Memory.hpp>
+#include <bedrocktools/sdk/Offsets.hpp>
+#include <bedrocktools/events/EventBus.hpp>
+#include "core/memory/Hooks.hpp"
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <mutex>
 
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <string>
-#include <utility>
+static BubbleChatModule* g_bubbleChatMod = nullptr;
 
-namespace {
+static void (*originalHandleText)(void*, void*, void*) = nullptr;
 
-// GuiData::displayChatMessage(
-//     const Player* player, ChatEvent::Name name,
-//     const std::string& senderName, const std::string& message,
-//     const std::string& xuid, const std::string& platformId);
-using DisplayChatMessageFn = void (*)(void*, void*, int, const std::string&, const std::string&, const std::string&, const std::string&);
-using ActorGetNameTagFn = std::string (*)(void*);
-using ActorSetNameTagFn = void (*)(void*, const std::string&);
-using LevelDtorFn = void (*)(void*);
+struct DistanceSortedActor { void* mActor; float mDistance; float _pad; };
+struct ActorVec { DistanceSortedActor* begin; DistanceSortedActor* end; DistanceSortedActor* cap; };
 
-BubbleChatModule* g_bubbleChat = nullptr;
-DisplayChatMessageFn g_displayChatMessageOriginal = nullptr;
-ActorGetNameTagFn g_getNameTag = nullptr;
-ActorSetNameTagFn g_setNameTag = nullptr;
-LevelDtorFn g_levelDtorOriginal = nullptr;
+using ActorFetchFn = ActorVec (*)(void*, void*, int);
+using ActorIsPlayerFn = bool (*)(void*);
+using ActorSetNameTagFn = void (*)(void*, std::string*);
 
-std::string truncateMessage(const std::string& message, int maxLength) {
-    if (maxLength <= 0 || static_cast<int>(message.size()) <= maxLength) return message;
-    return message.substr(0, static_cast<std::size_t>(maxLength)) + "...";
+static ActorFetchFn s_actorFetchNearby = nullptr;
+static ActorIsPlayerFn s_actorIsPlayer = nullptr;
+static ActorSetNameTagFn s_actorSetNameTag = nullptr;
+
+static std::string trimStr(const std::string& t) {
+    size_t b = t.find_first_not_of(" \t");
+    if (b == std::string::npos) return "";
+    size_t e = t.find_last_not_of(" \t");
+    return t.substr(b, e - b + 1);
 }
 
-void displayChatMessageHook(void* self, void* player, int name, const std::string& senderName,
-                            const std::string& message, const std::string& xuid,
-                            const std::string& platformId) {
-    if (g_displayChatMessageOriginal) {
-        g_displayChatMessageOriginal(self, player, name, senderName, message, xuid, platformId);
+static std::string stripColors(const std::string& in) {
+    std::string out;
+    for (size_t i = 0; i < in.length(); ++i) {
+        if ((unsigned char)in[i] == 0xC2 && i + 2 < in.length() && (unsigned char)in[i+1] == 0xA7) { i += 2; continue; }
+        out += in[i];
     }
-    if (g_bubbleChat && g_bubbleChat->enabled) {
-        g_bubbleChat->handleChatMessage(player, senderName, message);
+    return out;
+}
+
+static std::string normalizeName(const std::string& in) {
+    std::string s = stripColors(in);
+    std::string out;
+    for (char c : s) {
+        unsigned char u = (unsigned char)c;
+        if (u >= 'A' && u <= 'Z') u += 32;
+        if ((u >= 'a' && u <= 'z') || (u >= '0' && u <= '9')) out += (char)u;
     }
+    return out;
 }
 
-void levelDtorHook(void* self) {
-    // Safety net: when a level is destroyed the actor pointers we hold become
-    // dangling, so drop every bubble before that happens.
-    if (g_bubbleChat) g_bubbleChat->clearBubbles();
-    if (g_levelDtorOriginal) g_levelDtorOriginal(self);
+static std::string removeBrackets(const std::string& s) {
+    std::string out;
+    int depth = 0;
+    for (char c : s) {
+        if (c == '[') { depth++; continue; }
+        if (c == ']') { if (depth > 0) depth--; continue; }
+        if (depth == 0) out += c;
+    }
+    return out;
 }
 
-} // namespace
+static std::string wrapText(const std::string& s, size_t maxLen) {
+    std::string out;
+    size_t lineLen = 0;
+    size_t i = 0, n = s.length();
+    while (i < n) {
+        while (i < n && s[i] == ' ') ++i;
+        size_t j = i;
+        while (j < n && s[j] != ' ') ++j;
+        if (j == i) break;
+        std::string word = s.substr(i, j - i);
+        i = j;
+        if (lineLen == 0) {
+            while (word.length() > maxLen) { out += word.substr(0, maxLen); out += '\n'; word = word.substr(maxLen); }
+            out += word; lineLen = word.length();
+        } else if (lineLen + 1 + word.length() <= maxLen) {
+            out += ' '; out += word; lineLen += 1 + word.length();
+        } else {
+            out += '\n';
+            while (word.length() > maxLen) { out += word.substr(0, maxLen); out += '\n'; word = word.substr(maxLen); }
+            out += word; lineLen = word.length();
+        }
+    }
+    return out;
+}
 
-BubbleChatModule::BubbleChatModule()
-    : Module("Bubble Chat", "Shows chat messages in a bubble above the sender's head, like a nametag.") {
-    g_bubbleChat = this;
+static bool parseRawChat(const std::string& raw, std::string& author, std::string& msg) {
+    std::string s = stripColors(raw);
+
+    const std::string sep = "\xC2\xBB"; // »
+    size_t pos = s.find(sep);
+    if (pos != std::string::npos) {
+        author = trimStr(removeBrackets(s.substr(0, pos)));
+        msg = trimStr(s.substr(pos + sep.length()));
+        return !author.empty() && !msg.empty();
+    }
+
+    size_t start = s.find('<');
+    size_t end = s.find('>');
+    if (start != std::string::npos && end != std::string::npos && end > start) {
+        author = trimStr(s.substr(start + 1, end - start - 1));
+        msg = trimStr(s.substr(end + 1));
+        return !author.empty() && !msg.empty();
+    }
+
+    size_t colon = s.find(": ");
+    if (colon != std::string::npos && colon <= 32) {
+        author = trimStr(removeBrackets(s.substr(0, colon)));
+        msg = trimStr(s.substr(colon + 2));
+        return !author.empty() && !msg.empty();
+    }
+
+    return false;
+}
+
+static void handleTextHook(void* handler, void* source, void* packet) {
+    if (originalHandleText) originalHandleText(handler, source, packet);
+
+    if (!g_bubbleChatMod || !g_bubbleChatMod->enabled || !packet) return;
+
+    try {
+        uintptr_t payload = (uintptr_t)packet + bedrocktools::sdk::offsets::Packet::Size;
+        uint8_t type = *reinterpret_cast<uint8_t*>(payload + bedrocktools::sdk::offsets::TextPacketPayload::AuthorAndMessage::mType);
+
+        std::string author, message;
+
+        if (type == 1) {
+            author = stripColors(*reinterpret_cast<std::string*>(payload + bedrocktools::sdk::offsets::TextPacketPayload::AuthorAndMessage::mAuthor));
+            message = *reinterpret_cast<std::string*>(payload + bedrocktools::sdk::offsets::TextPacketPayload::AuthorAndMessage::mMessage);
+        } else if (type == 2) {
+            std::string key = *reinterpret_cast<std::string*>(payload + 0x78);
+            std::string* pbegin = *reinterpret_cast<std::string**>(payload + 0x90);
+            std::string* pend   = *reinterpret_cast<std::string**>(payload + 0x98);
+            if (pbegin && pend && pend >= pbegin && (pend - pbegin) <= 16 && (uintptr_t)pbegin > 0x1000) {
+                size_t cnt = (size_t)(pend - pbegin);
+                if (cnt >= 2 && key.find("chat.type") != std::string::npos) {
+                    author = stripColors(pbegin[0]);
+                    message = stripColors(pbegin[1]);
+                } else if (cnt >= 1) {
+                    message = stripColors(pbegin[0]);
+                }
+            }
+        } else if (type <= 9) {
+            message = *reinterpret_cast<std::string*>(payload + bedrocktools::sdk::offsets::TextPacketPayload::MessageOnly::mMessage);
+        } else {
+            return;
+        }
+
+        if (author.empty()) {
+            std::string pa, pm;
+            if (parseRawChat(message, pa, pm)) {
+                author = pa;
+                message = pm;
+            }
+        }
+
+        if (!author.empty() && !message.empty()) {
+            if (message.rfind(".bc", 0) == 0) {
+                std::string arg = trimStr(message.substr(3));
+                if (!arg.empty() && arg[0] >= '0' && arg[0] <= '9') {
+                    int v = atoi(arg.c_str());
+                    if (v >= 1 && v <= 15) { g_bubbleChatMod->setDuration(v); g_bubbleChatMod->addBubble(author, "Tempo da bolha: " + std::to_string(v) + "s"); }
+                } else if (arg == "cima" || arg == "above") {
+                    g_bubbleChatMod->setMsgAbove(true); g_bubbleChatMod->addBubble(author, "Msg acima do nome");
+                } else if (arg == "baixo" || arg == "below") {
+                    g_bubbleChatMod->setMsgAbove(false); g_bubbleChatMod->addBubble(author, "Msg abaixo do nome");
+                }
+                return;
+            }
+            g_bubbleChatMod->addBubble(author, message);
+        }
+    } catch (...) {}
+}
+
+static void tickCallback(void* player) {
+    if (!g_bubbleChatMod || !player) return;
+
+    if (g_bubbleChatMod->m_localPlayerPtr != player) {
+        g_bubbleChatMod->resetState();
+    }
+
+    g_bubbleChatMod->m_localPlayerPtr = player;
+    g_bubbleChatMod->applyBubbles(g_bubbleChatMod->enabled);
+}
+
+BubbleChatModule::BubbleChatModule() : Module("Bubble Chat", "Bolhas de chat acima da cabeca (estilo Roblox)") {
+    g_bubbleChatMod = this;
+    m_lastFrame = std::chrono::steady_clock::now();
 }
 
 BubbleChatModule::~BubbleChatModule() {
-    if (g_bubbleChat == this) g_bubbleChat = nullptr;
+    removeNametagPatch();
+    if (g_bubbleChatMod == this) g_bubbleChatMod = nullptr;
 }
 
-void BubbleChatModule::onInit() {
-    const auto displayChat = bedrocktools::memory::resolve(
-        bedrocktools::memory::SignatureId::GuiDataDisplayChatMessage
-    );
-    if (displayChat && !g_displayChatMessageOriginal) {
-        bedrocktools::hooks::install(
-            reinterpret_cast<void*>(displayChat),
-            reinterpret_cast<void*>(displayChatMessageHook),
-            reinterpret_cast<void**>(&g_displayChatMessageOriginal)
-        );
-    }
-
-    g_getNameTag = reinterpret_cast<ActorGetNameTagFn>(
-        bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorGetNameTag)
-    );
-    g_setNameTag = reinterpret_cast<ActorSetNameTagFn>(
-        bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)
-    );
-
-    const auto levelDtor = bedrocktools::memory::resolve(
-        bedrocktools::memory::SignatureId::LevelDtor
-    );
-    if (levelDtor && !g_levelDtorOriginal) {
-        bedrocktools::hooks::install(
-            reinterpret_cast<void*>(levelDtor),
-            reinterpret_cast<void*>(levelDtorHook),
-            reinterpret_cast<void**>(&g_levelDtorOriginal)
-        );
-    }
+void BubbleChatModule::setDuration(int secs) {
+    if (secs < 1) secs = 1;
+    if (secs > 15) secs = 15;
+    m_duration = secs;
 }
 
-void BubbleChatModule::onEnable() {}
-
-void BubbleChatModule::onDisable() {
-    restoreAll();
-}
-
-void BubbleChatModule::handleChatMessage(void* player, const std::string& senderName, const std::string& message) {
-    if (!player || !g_getNameTag || !g_setNameTag) return;
-    if (message.empty()) return;
-
-    if (!m_showSelf) {
-        auto* client = bedrocktools::sdk::ClientInstance::current();
-        if (client && client->localPlayer() == player) return;
-    }
-
-    const std::string text = truncateMessage(message, m_maxLength);
-    const auto now = std::chrono::steady_clock::now();
-    const auto lifetime = std::chrono::milliseconds(static_cast<long long>(m_duration * 1000.0f));
-
-    auto it = m_bubbles.find(player);
-    if (it == m_bubbles.end()) {
-        Bubble bubble;
-        bubble.originalNameTag = g_getNameTag(player);
-        bubble.text = text;
-        bubble.expires = now + lifetime;
-        m_bubbles.emplace(player, std::move(bubble));
-    } else {
-        // Keep the originally captured nametag; just refresh the text + expiry.
-        it->second.text = text;
-        it->second.expires = now + lifetime;
-    }
-
-    std::string display;
-    if (m_showName && !senderName.empty()) {
-        display = std::string("\xC2\xA7") + "a" + senderName + "\xC2\xA7" + "r: " + text;
-    } else {
-        display = text;
-    }
-    g_setNameTag(player, display);
-}
-
-void BubbleChatModule::expireBubbles() {
-    if (m_bubbles.empty()) return;
-    const auto now = std::chrono::steady_clock::now();
-    for (auto it = m_bubbles.begin(); it != m_bubbles.end();) {
-        if (now >= it->second.expires) {
-            if (g_setNameTag) g_setNameTag(it->first, it->second.originalNameTag);
-            it = m_bubbles.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void BubbleChatModule::restoreAll() {
-    if (g_setNameTag) {
-        for (const auto& [player, bubble] : m_bubbles) {
-            g_setNameTag(player, bubble.originalNameTag);
-        }
-    }
-    m_bubbles.clear();
-}
-
-void BubbleChatModule::clearBubbles() {
-    restoreAll();
-}
-
-void BubbleChatModule::onFrame() {
-    if (!enabled) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (m_lastCheck == std::chrono::steady_clock::time_point{} ||
-        now - m_lastCheck >= std::chrono::milliseconds(100)) {
-        m_lastCheck = now;
-        expireBubbles();
-    }
+void BubbleChatModule::setMsgAbove(bool above) {
+    m_msgAboveName = above;
 }
 
 void BubbleChatModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
-    if (j.contains("m_duration")) m_duration = std::clamp(j["m_duration"].get<float>(), 0.5f, 60.0f);
-    if (j.contains("m_showSelf")) m_showSelf = j["m_showSelf"].get<bool>();
-    if (j.contains("m_showName")) m_showName = j["m_showName"].get<bool>();
-    if (j.contains("m_maxLength")) m_maxLength = std::clamp(j["m_maxLength"].get<int>(), 4, 256);
+    if (j.contains("duration")) { int d = j.value("duration", 5); if (d < 1) d = 1; if (d > 15) d = 15; m_duration = d; }
+    if (j.contains("msgAbove")) m_msgAboveName = j.value("msgAbove", false);
 }
 
 void BubbleChatModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
-    j["m_duration"] = m_duration;
-    j["m_showSelf"] = m_showSelf;
-    j["m_showName"] = m_showName;
-    j["m_maxLength"] = m_maxLength;
+    j["duration"] = m_duration;
+    j["msgAbove"] = m_msgAboveName;
+}
+
+void BubbleChatModule::addBubble(const std::string& author, const std::string& message) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto& dq = m_bubbles[author];
+    dq.push_back({message, (float)m_duration});
+    while (dq.size() > 3) dq.pop_front();
+}
+
+void BubbleChatModule::onEnable() { ensureNametagPatch(); }
+
+void BubbleChatModule::onDisable() {
+    removeNametagPatch();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_bubbles.clear();
+}
+
+void BubbleChatModule::resetState() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_bubbles.clear();
+    m_overrides.clear();
+}
+
+void BubbleChatModule::ensureNametagPatch() {
+    if (!m_nametagPatchTarget) return;
+    uint32_t cur = 0;
+    memcpy(&cur, m_nametagPatchTarget, 4);
+    const uint32_t nop = 0xD503201F;
+    if (cur == nop) return;
+    if (!m_hasOrigBytes) { memcpy(m_nametagOrigBytes, &cur, 4); m_hasOrigBytes = true; }
+    bedrocktools::sdk::patchMemory(m_nametagPatchTarget, &nop, 4);
+    if (!m_nametagPatchedByUs) { m_nametagPatchedByUs = true; }
+}
+
+void BubbleChatModule::removeNametagPatch() {
+    if (!m_nametagPatchedByUs || !m_nametagPatchTarget) return;
+    bedrocktools::sdk::patchMemory(m_nametagPatchTarget, m_nametagOrigBytes, 4);
+    m_nametagPatchedByUs = false;
+    m_hasOrigBytes = false;
+}
+
+void BubbleChatModule::onFrame() {
+    ensureNametagPatch();
+    auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - m_lastFrame).count();
+    m_lastFrame = now;
+    if (dt < 0.0f) dt = 0.0f;
+    if (dt > 0.25f) dt = 0.25f;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto it = m_bubbles.begin(); it != m_bubbles.end(); ) {
+        auto& dq = it->second;
+        for (auto bi = dq.begin(); bi != dq.end(); ) {
+            bi->timer -= dt;
+            if (bi->timer <= 0.0f) bi = dq.erase(bi);
+            else ++bi;
+        }
+        if (dq.empty()) it = m_bubbles.erase(it);
+        else ++it;
+    }
+}
+
+void BubbleChatModule::onInit() {
+    uintptr_t textAddr = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ClientNetworkHandlerHandleText);
+    if (textAddr) bedrocktools::hooks::install((void*)textAddr, (void*)handleTextHook, (void**)&originalHandleText);
+
+    uintptr_t ntAddr = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::Nametag);
+    if (ntAddr) m_nametagPatchTarget = (void*)(ntAddr + bedrocktools::sdk::offsets::NameTag::mExtractNameTagsPatchOffset);
+
+    if (auto afn = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorFetchNearbyActorsSorted)) s_actorFetchNearby = (ActorFetchFn)afn;
+    if (auto aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer)) s_actorIsPlayer = (ActorIsPlayerFn)aip;
+    if (auto snt = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)) s_actorSetNameTag = (ActorSetNameTagFn)snt;
+
+    bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>([](const bedrocktools::events::LocalPlayerTickEvent& event) {
+        tickCallback(event.player);
+    });
+}
+
+void BubbleChatModule::applyBubbles(bool apply) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!apply) m_bubbles.clear();
+
+    if (m_bubbles.empty() && m_overrides.empty()) return;
+    if (!m_localPlayerPtr || !s_actorFetchNearby || !s_actorSetNameTag) return;
+
+    uintptr_t levelPtr = *(uintptr_t*)((uintptr_t)m_localPlayerPtr + bedrocktools::sdk::offsets::Actor::mLevel);
+    if (!levelPtr) return;
+    uintptr_t dimPtr = *(uintptr_t*)((uintptr_t)m_localPlayerPtr + bedrocktools::sdk::offsets::Actor::mDimension);
+    if (!dimPtr) return;
+
+    std::vector<void*> actors;
+    actors.push_back(m_localPlayerPtr);
+
+    bedrocktools::sdk::Vec3 extent = {30.0f, 30.0f, 30.0f};
+    ActorVec av = s_actorFetchNearby(m_localPlayerPtr, &extent, 1);
+    if (av.begin && av.end) {
+        for (DistanceSortedActor* it = av.begin; it < av.end; ++it) {
+            if (it->mActor && it->mActor != m_localPlayerPtr) actors.push_back(it->mActor);
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> normKeys;
+    for (auto& kv : m_bubbles) normKeys.push_back({normalizeName(kv.first), kv.first});
+
+    for (void* actor : actors) {
+        if (s_actorIsPlayer && !s_actorIsPlayer(actor)) continue;
+
+        uintptr_t addr = (uintptr_t)actor;
+        std::string* pName = (std::string*)(addr + bedrocktools::sdk::offsets::Player::mName);
+        std::string* pTag  = (std::string*)(addr + bedrocktools::sdk::offsets::Actor::mFilteredNameTag);
+
+        std::string n1 = (pName && !pName->empty()) ? *pName : "";
+        std::string n2 = (pTag  && !pTag->empty())  ? *pTag  : "";
+
+        std::string nn1 = normalizeName(n1);
+        std::string nn2 = normalizeName(n2);
+
+        auto ovIt = m_overrides.find(actor);
+        std::string original = (ovIt != m_overrides.end()) ? ovIt->second.original : "";
+
+        auto bIt = m_bubbles.end();
+        if (!original.empty()) bIt = m_bubbles.find(original);
+        if (bIt == m_bubbles.end()) { bIt = m_bubbles.find(n1); if (bIt != m_bubbles.end()) original = n1; }
+        if (bIt == m_bubbles.end()) { bIt = m_bubbles.find(n2); if (bIt != m_bubbles.end()) original = n2; }
+        if (bIt == m_bubbles.end()) {
+            for (auto& nk : normKeys) {
+                if (nk.first.length() < 3) continue;
+                if (nk.first == nn1 || nk.first == nn2 ||
+                    nn2.find(nk.first) != std::string::npos ||
+                    nn1.find(nk.first) != std::string::npos) {
+                    original = nk.second;
+                    bIt = m_bubbles.find(original);
+                    break;
+                }
+            }
+        }
+
+        if (bIt != m_bubbles.end()) {
+            std::string joined;
+            for (const auto& b : bIt->second) {
+                if (!joined.empty()) joined += "\n";
+                joined += wrapText("\xE2\x80\x94 " + b.message, 28);
+            }
+            std::string appliedStr;
+            if (m_msgAboveName) appliedStr = joined + "\n" + original;
+            else appliedStr = original + "\n" + joined;
+
+            if (n2 != appliedStr) {
+                s_actorSetNameTag(actor, &appliedStr);
+            }
+            m_overrides[actor] = {original, appliedStr};
+        } else if (ovIt != m_overrides.end()) {
+            if (n2 != ovIt->second.original) {
+                s_actorSetNameTag(actor, &ovIt->second.original);
+            }
+            m_overrides.erase(ovIt);
+        }
+    }
 }

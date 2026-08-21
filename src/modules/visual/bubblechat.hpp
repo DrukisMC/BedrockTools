@@ -1,47 +1,48 @@
 #pragma once
-
 #include "../Module.hpp"
-
-#include <chrono>
+#include <bedrocktools/sdk/Types.hpp>
 #include <string>
 #include <unordered_map>
+#include <deque>
+#include <vector>
+#include <mutex>
+#include <cstdint>
+#include <chrono>
 
-// Bubble Chat
-// Shows a chat message in a bubble above the sender's head, like a nametag,
-// but only while the message is fresh (it fades away after a few seconds).
 class BubbleChatModule : public Module {
 public:
     BubbleChatModule();
-    ~BubbleChatModule() override;
+    ~BubbleChatModule();
 
     void onInit() override;
     void onEnable() override;
     void onDisable() override;
     void onFrame() override;
-
     void loadConfig(const nlohmann::json& j) override;
     void saveConfig(nlohmann::json& j) override;
 
-    // Called from the displayChatMessage hook.
-    void handleChatMessage(void* player, const std::string& senderName, const std::string& message);
-    // Restores every active nametag (used on level unload / disable).
-    void clearBubbles();
+    void* m_localPlayerPtr = nullptr;
+    void addBubble(const std::string& author, const std::string& message);
+    void setDuration(int secs);
+    void setMsgAbove(bool above);
+    void applyBubbles(bool apply);
+    void resetState();
+    void ensureNametagPatch();
+    void removeNametagPatch();
 
-    float m_duration = 4.0f;   // seconds the bubble stays visible
-    bool  m_showSelf = true;   // show bubbles for your own messages too
-    bool  m_showName = true;   // prefix the sender's name in the bubble
-    int   m_maxLength = 48;    // truncate long messages (0 = no limit)
+    struct Bubble { std::string message; float timer; };
+    std::unordered_map<std::string, std::deque<Bubble>> m_bubbles;
+    std::mutex m_mutex;
+    int m_duration = 5;
+    bool m_msgAboveName = false;
 
 private:
-    struct Bubble {
-        std::string originalNameTag;                 // captured before we take over
-        std::string text;                            // last message text
-        std::chrono::steady_clock::time_point expires;
-    };
+    struct Override { std::string original; std::string applied; };
+    std::unordered_map<void*, Override> m_overrides;
+    std::chrono::steady_clock::time_point m_lastFrame;
 
-    void expireBubbles();
-    void restoreAll();
-
-    std::unordered_map<void*, Bubble> m_bubbles;
-    std::chrono::steady_clock::time_point m_lastCheck{};
+    void* m_nametagPatchTarget = nullptr;
+    uint8_t m_nametagOrigBytes[4] = {0, 0, 0, 0};
+    bool m_hasOrigBytes = false;
+    bool m_nametagPatchedByUs = false;
 };
