@@ -4,6 +4,7 @@
 #include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/events/EventBus.hpp>
 #include "core/memory/Hooks.hpp"
+#include <pl/memory/Vtable.hpp>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -12,6 +13,16 @@
 static BubbleChatModule* g_bubbleChatMod = nullptr;
 
 static void (*originalHandleText)(void*, void*, void*) = nullptr;
+
+// NameTagRenderer::render — vtable slot 17.
+// Signature: void render(void* self, void* uiRenderContext, void* uiControl, void* uiAnchor)
+static void (*s_nameTagRenderOrig)(void*, void*, void*, void*) = nullptr;
+
+static void nameTagRenderHook(void* self, void* uiCtx, void* uiControl, void* uiAnchor) {
+    if (s_nameTagRenderOrig) s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
+    if (!g_bubbleChatMod || !g_bubbleChatMod->enabled || !g_bubbleChatMod->m_separateBubble) return;
+    g_bubbleChatMod->renderSeparateBubble(self, uiCtx, uiControl, uiAnchor);
+}
 
 struct DistanceSortedActor { void* mActor; float mDistance; float _pad; };
 struct ActorVec { DistanceSortedActor* begin; DistanceSortedActor* end; DistanceSortedActor* cap; };
@@ -210,12 +221,14 @@ void BubbleChatModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
     if (j.contains("duration")) { int d = j.value("duration", 5); if (d < 1) d = 1; if (d > 15) d = 15; m_duration = d; }
     if (j.contains("msgAbove")) m_msgAboveName = j.value("msgAbove", false);
+    if (j.contains("separateBubble")) m_separateBubble = j.value("separateBubble", false);
 }
 
 void BubbleChatModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
     j["duration"] = m_duration;
     j["msgAbove"] = m_msgAboveName;
+    j["separateBubble"] = m_separateBubble;
 }
 
 void BubbleChatModule::addBubble(const std::string& author, const std::string& message) {
@@ -288,6 +301,16 @@ void BubbleChatModule::onInit() {
     if (auto aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer)) s_actorIsPlayer = (ActorIsPlayerFn)aip;
     if (auto snt = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)) s_actorSetNameTag = (ActorSetNameTagFn)snt;
 
+    // Hook NameTagRenderer::render (vtable slot 17) for the separate-bubble mode.
+    if (!s_nameTagRenderOrig) {
+        const auto target = pl::memory::resolveVtableFunction("15NameTagRenderer", 17, "libminecraftpe.so");
+        if (target) {
+            bedrocktools::hooks::install(reinterpret_cast<void*>(target),
+                                         reinterpret_cast<void*>(nameTagRenderHook),
+                                         reinterpret_cast<void**>(&s_nameTagRenderOrig));
+        }
+    }
+
     bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>([](const bedrocktools::events::LocalPlayerTickEvent& event) {
         tickCallback(event.player);
     });
@@ -297,6 +320,10 @@ void BubbleChatModule::applyBubbles(bool apply) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     if (!apply) m_bubbles.clear();
+
+    // In separate-bubble mode the message is drawn by the NameTagRenderer hook,
+    // not by overriding the nametag text.
+    if (m_separateBubble) return;
 
     if (m_bubbles.empty() && m_overrides.empty()) return;
     if (!m_localPlayerPtr || !s_actorFetchNearby || !s_actorSetNameTag) return;
@@ -373,5 +400,76 @@ void BubbleChatModule::applyBubbles(bool apply) {
             }
             m_overrides.erase(ovIt);
         }
+    }
+}
+
+// Separate-bubble renderer. Called from the NameTagRenderer::render hook
+// (vtable slot 17) AFTER the original nametag has been drawn.
+//
+// The render object layout (this build):
+//   [this+0x08] float scale
+//   [this+0x28] std::string  -> text that gets drawn (player name)
+//   [this+0x40..0x5c] mce::Color
+// The anchor object:
+//   [anchor+0x10] Vec2 position (screen anchor)
+//   [anchor+0x40] Vec2 size (nametag width/height)
+void BubbleChatModule::renderSeparateBubble(void* self, void* uiCtx, void* uiControl, void* uiAnchor) {
+    if (!self || !uiAnchor || !s_nameTagRenderOrig) return;
+
+    try {
+        std::string* pName = reinterpret_cast<std::string*>(reinterpret_cast<std::uintptr_t>(self) + 0x28);
+        if (!pName || pName->empty()) return;
+
+        const std::string playerName = stripColors(*pName);
+        if (playerName.empty()) return;
+
+        // Find which author key matches this player's nametag.
+        std::string foundKey;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_bubbles.find(playerName);
+            if (it != m_bubbles.end()) {
+                foundKey = playerName;
+            } else {
+                const std::string norm = normalizeName(playerName);
+                for (const auto& kv : m_bubbles) {
+                    if (normalizeName(kv.first) == norm) { foundKey = kv.first; break; }
+                }
+            }
+        }
+        if (foundKey.empty()) return;
+
+        // Build the stacked bubble text.
+        std::string joined;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_bubbles.find(foundKey);
+            if (it == m_bubbles.end() || it->second.empty()) return;
+            for (const auto& b : it->second) {
+                if (!joined.empty()) joined += "\n";
+                joined += wrapText(b.message, 28);
+            }
+        }
+        if (joined.empty()) return;
+
+        float* pos = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(uiAnchor) + 0x10);
+        float* size = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(uiAnchor) + 0x40);
+        const float height = (size[1] > 1.0f) ? size[1] : 20.0f;
+        const float gap = 4.0f;
+
+        const std::string original = *pName;
+        const float origY = pos[1];
+
+        // Swap the text and lift the anchor, then re-render to draw the bubble
+        // above the nametag as its own panel + text.
+        *pName = joined;
+        pos[1] = origY - (height + gap);
+
+        s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
+
+        pos[1] = origY;
+        *pName = original;
+    } catch (...) {
+        // Never let a rendering edge case crash the game.
     }
 }

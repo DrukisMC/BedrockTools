@@ -30,11 +30,17 @@ public:
     void ensureNametagPatch();
     void removeNametagPatch();
 
+    // Separate-bubble mode: draws the message in its own panel ABOVE the
+    // nametag (does not touch the nametag text). Hooked on
+    // NameTagRenderer::render (vtable slot 17).
+    void renderSeparateBubble(void* self, void* uiCtx, void* uiControl, void* uiAnchor);
+
     struct Bubble { std::string message; float timer; };
     std::unordered_map<std::string, std::deque<Bubble>> m_bubbles;
     std::mutex m_mutex;
     int m_duration = 5;
     bool m_msgAboveName = false;
+    bool m_separateBubble = false;
 
 private:
     struct Override { std::string original; std::string applied; };
