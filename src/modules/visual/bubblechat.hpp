@@ -29,14 +29,15 @@ public:
     void ensureNametagPatch();
     void removeNametagPatch();
 
-    // Color override for the NameTagRenderer hook: when a player's nametag is
-    // currently showing a chat message, force white background + black text.
-    bool isBubbleNametag(void* self);
+    // Separate-bubble mode: draws a nametag-style box with the message ABOVE
+    // the player's regular nametag (hook on NameTagRenderer::render).
+    void renderSeparateBubble(void* self, void* uiCtx, void* uiControl, void* uiAnchor);
 
     struct Bubble { std::string message; float timer; };
     std::unordered_map<std::string, std::deque<Bubble>> m_bubbles;
     std::mutex m_mutex;
     int m_duration = 5;
+    bool m_separateBubble = false;
 
 private:
     struct Override { std::string original; std::string applied; };
