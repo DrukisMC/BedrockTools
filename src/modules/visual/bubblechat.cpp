@@ -18,10 +18,46 @@ static void (*originalHandleText)(void*, void*, void*) = nullptr;
 // Signature: void render(void* self, void* uiRenderContext, void* uiControl, void* uiAnchor)
 static void (*s_nameTagRenderOrig)(void*, void*, void*, void*) = nullptr;
 
+// Called on every nametag render. When the nametag is currently showing a chat
+// message (bubble), we force white background + black text for that one draw.
 static void nameTagRenderHook(void* self, void* uiCtx, void* uiControl, void* uiAnchor) {
+    if (!g_bubbleChatMod || !g_bubbleChatMod->enabled || !self) {
+        if (s_nameTagRenderOrig) s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
+        return;
+    }
+
+    const bool isBubble = g_bubbleChatMod->isBubbleNametag(self);
+
+    float* textColor = nullptr;
+    float* panelColor = nullptr;
+    float savedText[4]{};
+    float savedPanel[4]{};
+
+    if (isBubble) {
+        // NameTagRenderer layout (this build):
+        //   [this+0x40] = text color (mce::Color, 4 floats)
+        //   [this+0x50] = panel/background color (mce::Color, 4 floats)
+        textColor = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(self) + 0x40);
+        panelColor = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(self) + 0x50);
+
+        savedText[0] = textColor[0]; savedText[1] = textColor[1];
+        savedText[2] = textColor[2]; savedText[3] = textColor[3];
+        savedPanel[0] = panelColor[0]; savedPanel[1] = panelColor[1];
+        savedPanel[2] = panelColor[2]; savedPanel[3] = panelColor[3];
+
+        // Black text on white background.
+        textColor[0] = 0.0f; textColor[1] = 0.0f; textColor[2] = 0.0f; textColor[3] = 1.0f;
+        panelColor[0] = 1.0f; panelColor[1] = 1.0f; panelColor[2] = 1.0f; panelColor[3] = 1.0f;
+    }
+
     if (s_nameTagRenderOrig) s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
-    if (!g_bubbleChatMod || !g_bubbleChatMod->enabled || !g_bubbleChatMod->m_separateBubble) return;
-    g_bubbleChatMod->renderSeparateBubble(self, uiCtx, uiControl, uiAnchor);
+
+    if (isBubble) {
+        textColor[0] = savedText[0]; textColor[1] = savedText[1];
+        textColor[2] = savedText[2]; textColor[3] = savedText[3];
+        panelColor[0] = savedPanel[0]; panelColor[1] = savedPanel[1];
+        panelColor[2] = savedPanel[2]; panelColor[3] = savedPanel[3];
+    }
 }
 
 struct DistanceSortedActor { void* mActor; float mDistance; float _pad; };
@@ -174,10 +210,6 @@ static void handleTextHook(void* handler, void* source, void* packet) {
                 if (!arg.empty() && arg[0] >= '0' && arg[0] <= '9') {
                     int v = atoi(arg.c_str());
                     if (v >= 1 && v <= 15) { g_bubbleChatMod->setDuration(v); g_bubbleChatMod->addBubble(author, "Tempo da bolha: " + std::to_string(v) + "s"); }
-                } else if (arg == "cima" || arg == "above") {
-                    g_bubbleChatMod->setMsgAbove(true); g_bubbleChatMod->addBubble(author, "Msg acima do nome");
-                } else if (arg == "baixo" || arg == "below") {
-                    g_bubbleChatMod->setMsgAbove(false); g_bubbleChatMod->addBubble(author, "Msg abaixo do nome");
                 }
                 return;
             }
@@ -213,22 +245,14 @@ void BubbleChatModule::setDuration(int secs) {
     m_duration = secs;
 }
 
-void BubbleChatModule::setMsgAbove(bool above) {
-    m_msgAboveName = above;
-}
-
 void BubbleChatModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
     if (j.contains("duration")) { int d = j.value("duration", 5); if (d < 1) d = 1; if (d > 15) d = 15; m_duration = d; }
-    if (j.contains("msgAbove")) m_msgAboveName = j.value("msgAbove", false);
-    if (j.contains("separateBubble")) m_separateBubble = j.value("separateBubble", false);
 }
 
 void BubbleChatModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
     j["duration"] = m_duration;
-    j["msgAbove"] = m_msgAboveName;
-    j["separateBubble"] = m_separateBubble;
 }
 
 void BubbleChatModule::addBubble(const std::string& author, const std::string& message) {
@@ -244,6 +268,7 @@ void BubbleChatModule::onDisable() {
     removeNametagPatch();
     std::lock_guard<std::mutex> lock(m_mutex);
     m_bubbles.clear();
+    m_overrides.clear();
 }
 
 void BubbleChatModule::resetState() {
@@ -301,13 +326,18 @@ void BubbleChatModule::onInit() {
     if (auto aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer)) s_actorIsPlayer = (ActorIsPlayerFn)aip;
     if (auto snt = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)) s_actorSetNameTag = (ActorSetNameTagFn)snt;
 
-    // Hook NameTagRenderer::render (vtable slot 17) for the separate-bubble mode.
+    // Hook NameTagRenderer::render for the white/black color override.
+    // Prefer RTTI vtable resolution; fall back to a byte signature.
     if (!s_nameTagRenderOrig) {
-        const auto target = pl::memory::resolveVtableFunction("15NameTagRenderer", 17, "libminecraftpe.so");
+        void* target = nullptr;
+        const auto vt = pl::memory::resolveVtableFunction("15NameTagRenderer", 17, "libminecraftpe.so");
+        if (vt) target = reinterpret_cast<void*>(vt);
+        if (!target) {
+            const auto sig = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::NameTagRendererRender);
+            if (sig) target = reinterpret_cast<void*>(sig);
+        }
         if (target) {
-            bedrocktools::hooks::install(reinterpret_cast<void*>(target),
-                                         reinterpret_cast<void*>(nameTagRenderHook),
-                                         reinterpret_cast<void**>(&s_nameTagRenderOrig));
+            bedrocktools::hooks::install(target, reinterpret_cast<void*>(nameTagRenderHook), reinterpret_cast<void**>(&s_nameTagRenderOrig));
         }
     }
 
@@ -316,14 +346,26 @@ void BubbleChatModule::onInit() {
     });
 }
 
+bool BubbleChatModule::isBubbleNametag(void* self) {
+    if (!self) return false;
+    std::string* pText = reinterpret_cast<std::string*>(reinterpret_cast<std::uintptr_t>(self) + 0x28);
+    if (!pText) return false;
+
+    std::string drawn;
+    try { drawn = stripColors(*pText); } catch (...) { return false; }
+    if (drawn.empty()) return false;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& kv : m_overrides) {
+        if (stripColors(kv.second.applied) == drawn) return true;
+    }
+    return false;
+}
+
 void BubbleChatModule::applyBubbles(bool apply) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     if (!apply) m_bubbles.clear();
-
-    // In separate-bubble mode the message is drawn by the NameTagRenderer hook,
-    // not by overriding the nametag text.
-    if (m_separateBubble) return;
 
     if (m_bubbles.empty() && m_overrides.empty()) return;
     if (!m_localPlayerPtr || !s_actorFetchNearby || !s_actorSetNameTag) return;
@@ -381,14 +423,14 @@ void BubbleChatModule::applyBubbles(bool apply) {
         }
 
         if (bIt != m_bubbles.end()) {
+            // The nametag BECOMES the message (no name prefix). Stacked messages
+            // are joined with newlines. Colors are stripped so the text is plain.
             std::string joined;
             for (const auto& b : bIt->second) {
                 if (!joined.empty()) joined += "\n";
-                joined += wrapText("\xE2\x80\x94 " + b.message, 28);
+                joined += wrapText(stripColors(b.message), 28);
             }
-            std::string appliedStr;
-            if (m_msgAboveName) appliedStr = joined + "\n" + original;
-            else appliedStr = original + "\n" + joined;
+            std::string appliedStr = joined;
 
             if (n2 != appliedStr) {
                 s_actorSetNameTag(actor, &appliedStr);
@@ -400,76 +442,5 @@ void BubbleChatModule::applyBubbles(bool apply) {
             }
             m_overrides.erase(ovIt);
         }
-    }
-}
-
-// Separate-bubble renderer. Called from the NameTagRenderer::render hook
-// (vtable slot 17) AFTER the original nametag has been drawn.
-//
-// The render object layout (this build):
-//   [this+0x08] float scale
-//   [this+0x28] std::string  -> text that gets drawn (player name)
-//   [this+0x40..0x5c] mce::Color
-// The anchor object:
-//   [anchor+0x10] Vec2 position (screen anchor)
-//   [anchor+0x40] Vec2 size (nametag width/height)
-void BubbleChatModule::renderSeparateBubble(void* self, void* uiCtx, void* uiControl, void* uiAnchor) {
-    if (!self || !uiAnchor || !s_nameTagRenderOrig) return;
-
-    try {
-        std::string* pName = reinterpret_cast<std::string*>(reinterpret_cast<std::uintptr_t>(self) + 0x28);
-        if (!pName || pName->empty()) return;
-
-        const std::string playerName = stripColors(*pName);
-        if (playerName.empty()) return;
-
-        // Find which author key matches this player's nametag.
-        std::string foundKey;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_bubbles.find(playerName);
-            if (it != m_bubbles.end()) {
-                foundKey = playerName;
-            } else {
-                const std::string norm = normalizeName(playerName);
-                for (const auto& kv : m_bubbles) {
-                    if (normalizeName(kv.first) == norm) { foundKey = kv.first; break; }
-                }
-            }
-        }
-        if (foundKey.empty()) return;
-
-        // Build the stacked bubble text.
-        std::string joined;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_bubbles.find(foundKey);
-            if (it == m_bubbles.end() || it->second.empty()) return;
-            for (const auto& b : it->second) {
-                if (!joined.empty()) joined += "\n";
-                joined += wrapText(b.message, 28);
-            }
-        }
-        if (joined.empty()) return;
-
-        float* pos = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(uiAnchor) + 0x10);
-        float* size = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(uiAnchor) + 0x40);
-        const float height = (size[1] > 1.0f) ? size[1] : 20.0f;
-        const float gap = 4.0f;
-
-        const std::string original = *pName;
-        const float origY = pos[1];
-
-        // Swap the text and lift the anchor, then re-render to draw the bubble
-        // above the nametag as its own panel + text.
-        *pName = joined;
-        pos[1] = origY - (height + gap);
-
-        s_nameTagRenderOrig(self, uiCtx, uiControl, uiAnchor);
-
-        pos[1] = origY;
-        *pName = original;
-    } catch (...) {
-        // Never let a rendering edge case crash the game.
     }
 }

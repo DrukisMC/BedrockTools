@@ -130,6 +130,7 @@ const std::array<SignatureDefinition, SignatureCount> definitions{{
     SignatureDefinition{SignatureId::BlockOccluderUpdateRenderFace, "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 F3 03 00 AA F5 03 04 2A"},
     SignatureDefinition{SignatureId::ItemInHandRendererRenderFirstPerson, "? ? ? D1 ? ? ? 6D ? ? ? 6D ? ? ? 6D ? ? ? 6D ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D5 FC 03 00 AA"},
     SignatureDefinition{SignatureId::MobGetModifiedSwingDuration, "? ? ? A9 ? ? ? A9 FD 03 00 91 ? ? ? 52 F3 03 00 AA ? ? ? 94 ? ? ? B4"},
+    SignatureDefinition{SignatureId::NameTagRendererRender, "FF 03 06 D1 EC 7B 00 FD EB 2B 10 6D E9 23 11 6D FD 7B 12 A9 FC 6F 13 A9 FA 67 14 A9 F8 5F 15 A9 F6 57 16 A9 F4 4F 17 A9 FD 83 04 91 5A D0 3B D5 F3 03 00 AA E0 03 03 AA 48 17 40 F9 F6 03 03 AA F5 03 02 AA F4 03 01 AA A8 03 1C F8 ? ? ? ?"},
 }};
 }
 
