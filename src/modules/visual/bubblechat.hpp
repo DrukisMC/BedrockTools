@@ -24,23 +24,18 @@ public:
     void* m_localPlayerPtr = nullptr;
     void addBubble(const std::string& author, const std::string& message);
     void setDuration(int secs);
-    void applyBubbles(bool apply);
-    void resetState();
-    void ensureNametagPatch();
-    void removeNametagPatch();
 
     struct Bubble { std::string message; float timer; };
     std::unordered_map<std::string, std::deque<Bubble>> m_bubbles;
     std::mutex m_mutex;
     int m_duration = 5;
 
-private:
-    struct Override { std::string original; std::string applied; };
-    std::unordered_map<void*, Override> m_overrides;
-    std::chrono::steady_clock::time_point m_lastFrame;
+    // Rendering settings
+    float m_fov = 70.0f;        // vertical FOV used for world->screen projection
+    float m_scale = 1.0f;       // bubble size scale
+    float m_heightOffset = 2.2f; // height above feet where the bubble anchors
+    bool m_showOwnBubbles = true; // show bubbles for your own messages (3rd person)
 
-    void* m_nametagPatchTarget = nullptr;
-    uint8_t m_nametagOrigBytes[4] = {0, 0, 0, 0};
-    bool m_hasOrigBytes = false;
-    bool m_nametagPatchedByUs = false;
+private:
+    std::chrono::steady_clock::time_point m_lastFrame;
 };
