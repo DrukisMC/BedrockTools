@@ -1,21 +1,13 @@
 #include "bubblechat.hpp"
-#include "modules/ModuleRegistry.hpp"
 #include <bedrocktools/memory/Signatures.hpp>
 #include <bedrocktools/sdk/Memory.hpp>
 #include <bedrocktools/sdk/Offsets.hpp>
-#include <bedrocktools/sdk/client/ClientInstance.hpp>
-#include <bedrocktools/sdk/world/Actor.hpp>
-#include <bedrocktools/sdk/world/Level.hpp>
 #include <bedrocktools/events/EventBus.hpp>
 #include "core/memory/Hooks.hpp"
-#include <EGL/egl.h>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
-#include <list>
-#include <algorithm>
 
 static BubbleChatModule* g_bubbleChatMod = nullptr;
 
@@ -26,9 +18,11 @@ struct ActorVec { DistanceSortedActor* begin; DistanceSortedActor* end; Distance
 
 using ActorFetchFn = ActorVec (*)(void*, void*, int);
 using ActorIsPlayerFn = bool (*)(void*);
+using ActorSetNameTagFn = void (*)(void*, std::string*);
 
 static ActorFetchFn s_actorFetchNearby = nullptr;
 static ActorIsPlayerFn s_actorIsPlayer = nullptr;
+static ActorSetNameTagFn s_actorSetNameTag = nullptr;
 
 static std::string trimStr(const std::string& t) {
     size_t b = t.find_first_not_of(" \t");
@@ -64,6 +58,31 @@ static std::string removeBrackets(const std::string& s) {
         if (c == '[') { depth++; continue; }
         if (c == ']') { if (depth > 0) depth--; continue; }
         if (depth == 0) out += c;
+    }
+    return out;
+}
+
+static std::string wrapText(const std::string& s, size_t maxLen) {
+    std::string out;
+    size_t lineLen = 0;
+    size_t i = 0, n = s.length();
+    while (i < n) {
+        while (i < n && s[i] == ' ') ++i;
+        size_t j = i;
+        while (j < n && s[j] != ' ') ++j;
+        if (j == i) break;
+        std::string word = s.substr(i, j - i);
+        i = j;
+        if (lineLen == 0) {
+            while (word.length() > maxLen) { out += word.substr(0, maxLen); out += '\n'; word = word.substr(maxLen); }
+            out += word; lineLen = word.length();
+        } else if (lineLen + 1 + word.length() <= maxLen) {
+            out += ' '; out += word; lineLen += 1 + word.length();
+        } else {
+            out += '\n';
+            while (word.length() > maxLen) { out += word.substr(0, maxLen); out += '\n'; word = word.substr(maxLen); }
+            out += word; lineLen = word.length();
+        }
     }
     return out;
 }
@@ -144,6 +163,10 @@ static void handleTextHook(void* handler, void* source, void* packet) {
                 if (!arg.empty() && arg[0] >= '0' && arg[0] <= '9') {
                     int v = atoi(arg.c_str());
                     if (v >= 1 && v <= 15) { g_bubbleChatMod->setDuration(v); g_bubbleChatMod->addBubble(author, "Tempo da bolha: " + std::to_string(v) + "s"); }
+                } else if (arg == "cima" || arg == "above") {
+                    g_bubbleChatMod->setMsgAbove(true); g_bubbleChatMod->addBubble(author, "Msg acima do nome");
+                } else if (arg == "baixo" || arg == "below") {
+                    g_bubbleChatMod->setMsgAbove(false); g_bubbleChatMod->addBubble(author, "Msg abaixo do nome");
                 }
                 return;
             }
@@ -152,12 +175,24 @@ static void handleTextHook(void* handler, void* source, void* packet) {
     } catch (...) {}
 }
 
+static void tickCallback(void* player) {
+    if (!g_bubbleChatMod || !player) return;
+
+    if (g_bubbleChatMod->m_localPlayerPtr != player) {
+        g_bubbleChatMod->resetState();
+    }
+
+    g_bubbleChatMod->m_localPlayerPtr = player;
+    g_bubbleChatMod->applyBubbles(g_bubbleChatMod->enabled);
+}
+
 BubbleChatModule::BubbleChatModule() : Module("Bubble Chat", "Bolhas de chat acima da cabeca (estilo Roblox)") {
     g_bubbleChatMod = this;
     m_lastFrame = std::chrono::steady_clock::now();
 }
 
 BubbleChatModule::~BubbleChatModule() {
+    removeNametagPatch();
     if (g_bubbleChatMod == this) g_bubbleChatMod = nullptr;
 }
 
@@ -167,22 +202,20 @@ void BubbleChatModule::setDuration(int secs) {
     m_duration = secs;
 }
 
+void BubbleChatModule::setMsgAbove(bool above) {
+    m_msgAboveName = above;
+}
+
 void BubbleChatModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
     if (j.contains("duration")) { int d = j.value("duration", 5); if (d < 1) d = 1; if (d > 15) d = 15; m_duration = d; }
-    if (j.contains("fov")) m_fov = std::clamp(j["fov"].get<float>(), 30.0f, 120.0f);
-    if (j.contains("scale")) m_scale = std::clamp(j["scale"].get<float>(), 0.5f, 3.0f);
-    if (j.contains("heightOffset")) m_heightOffset = std::clamp(j["heightOffset"].get<float>(), 0.5f, 5.0f);
-    if (j.contains("showOwnBubbles")) m_showOwnBubbles = j["showOwnBubbles"].get<bool>();
+    if (j.contains("msgAbove")) m_msgAboveName = j.value("msgAbove", false);
 }
 
 void BubbleChatModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
     j["duration"] = m_duration;
-    j["fov"] = m_fov;
-    j["scale"] = m_scale;
-    j["heightOffset"] = m_heightOffset;
-    j["showOwnBubbles"] = m_showOwnBubbles;
+    j["msgAbove"] = m_msgAboveName;
 }
 
 void BubbleChatModule::addBubble(const std::string& author, const std::string& message) {
@@ -192,213 +225,153 @@ void BubbleChatModule::addBubble(const std::string& author, const std::string& m
     while (dq.size() > 3) dq.pop_front();
 }
 
-void BubbleChatModule::onEnable() {}
+void BubbleChatModule::onEnable() { ensureNametagPatch(); }
 
 void BubbleChatModule::onDisable() {
+    removeNametagPatch();
     std::lock_guard<std::mutex> lock(m_mutex);
     m_bubbles.clear();
 }
 
-static float calcTextWidth(const std::string& text, float size) {
-    float width = 0;
-    for (char c : text) {
-        if (c == 'i' || c == 'l' || c == '1' || c == ':' || c == '.' || c == ' ' || c == '!') width += size * 0.32f;
-        else if (c == 'm' || c == 'w' || c == 'M' || c == 'W') width += size * 0.82f;
-        else width += size * 0.58f;
-    }
-    return width;
+void BubbleChatModule::resetState() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_bubbles.clear();
+    m_overrides.clear();
 }
 
-// Project a world-space point to screen pixel coordinates.
-// Returns false if the point is behind the camera.
-static bool worldToScreen(const bedrocktools::sdk::Vec3& camPos, float yaw, float pitch,
-                          const bedrocktools::sdk::Vec3& world, float fovV,
-                          int screenW, int screenH, float& outX, float& outY) {
-    const float PI = 3.14159265f;
-    const float yawR = yaw * (PI / 180.0f);
-    const float pitchR = pitch * (PI / 180.0f);
+void BubbleChatModule::ensureNametagPatch() {
+    if (!m_nametagPatchTarget) return;
+    uint32_t cur = 0;
+    memcpy(&cur, m_nametagPatchTarget, 4);
+    const uint32_t nop = 0xD503201F;
+    if (cur == nop) return;
+    if (!m_hasOrigBytes) { memcpy(m_nametagOrigBytes, &cur, 4); m_hasOrigBytes = true; }
+    bedrocktools::sdk::patchMemory(m_nametagPatchTarget, &nop, 4);
+    if (!m_nametagPatchedByUs) { m_nametagPatchedByUs = true; }
+}
 
-    const float cy = std::cos(yawR), sy = std::sin(yawR);
-    const float cp = std::cos(pitchR), sp = std::sin(pitchR);
-
-    // Camera basis (Minecraft convention: yaw clockwise from +Z, pitch down positive).
-    bedrocktools::sdk::Vec3 fwd{-sy * cp, -sp, cy * cp};
-    bedrocktools::sdk::Vec3 right{cy, 0.0f, sy};
-    bedrocktools::sdk::Vec3 up{-sy * sp, cp, cy * sp};
-
-    const float dx = world.x - camPos.x;
-    const float dy = world.y - camPos.y;
-    const float dz = world.z - camPos.z;
-
-    const float zCam = dx * fwd.x + dy * fwd.y + dz * fwd.z;
-    if (zCam < 0.1f) return false; // behind the camera
-
-    const float xCam = dx * right.x + dy * right.y + dz * right.z;
-    const float yCam = dx * up.x + dy * up.y + dz * up.z;
-
-    const float f = (screenH * 0.5f) / std::tan((fovV * 0.5f) * (PI / 180.0f));
-    outX = (screenW * 0.5f) + (xCam * f / zCam);
-    outY = (screenH * 0.5f) - (yCam * f / zCam);
-    return true;
+void BubbleChatModule::removeNametagPatch() {
+    if (!m_nametagPatchedByUs || !m_nametagPatchTarget) return;
+    bedrocktools::sdk::patchMemory(m_nametagPatchTarget, m_nametagOrigBytes, 4);
+    m_nametagPatchedByUs = false;
+    m_hasOrigBytes = false;
 }
 
 void BubbleChatModule::onFrame() {
-    if (!enabled) return;
-
-    const auto now = std::chrono::steady_clock::now();
+    ensureNametagPatch();
+    auto now = std::chrono::steady_clock::now();
     float dt = std::chrono::duration<float>(now - m_lastFrame).count();
     m_lastFrame = now;
     if (dt < 0.0f) dt = 0.0f;
     if (dt > 0.25f) dt = 0.25f;
-
-    // Update timers.
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        for (auto it = m_bubbles.begin(); it != m_bubbles.end(); ) {
-            auto& dq = it->second;
-            for (auto bi = dq.begin(); bi != dq.end(); ) {
-                bi->timer -= dt;
-                if (bi->timer <= 0.0f) bi = dq.erase(bi);
-                else ++bi;
-            }
-            if (dq.empty()) it = m_bubbles.erase(it);
-            else ++it;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto it = m_bubbles.begin(); it != m_bubbles.end(); ) {
+        auto& dq = it->second;
+        for (auto bi = dq.begin(); bi != dq.end(); ) {
+            bi->timer -= dt;
+            if (bi->timer <= 0.0f) bi = dq.erase(bi);
+            else ++bi;
         }
+        if (dq.empty()) it = m_bubbles.erase(it);
+        else ++it;
     }
-
-    auto* client = bedrocktools::sdk::ClientInstance::current();
-    if (!client) return;
-
-    auto* localPlayer = client->localPlayer();
-    if (!localPlayer) return;
-    m_localPlayerPtr = localPlayer;
-
-    if (!s_actorFetchNearby || !s_actorIsPlayer) return;
-
-    // Camera position (smooth camera) + rotation.
-    bedrocktools::sdk::Vec3 camPos = localPlayer->position();
-    camPos.y += 1.62f;
-    auto* lr = client->levelRenderer();
-    if (lr && lr->playerRenderer()) {
-        const auto cp = lr->playerRenderer()->cameraPosition();
-        camPos = cp;
-    }
-    const auto rot = localPlayer->rotation(); // {pitch, yaw}
-    const float yaw = rot.y;
-    const float pitch = rot.x;
-
-    // Screen size.
-    int screenW = 0, screenH = 0;
-    EGLDisplay display = eglGetCurrentDisplay();
-    EGLSurface surface = eglGetCurrentSurface(EGL_DRAW);
-    if (display != EGL_NO_DISPLAY && surface != EGL_NO_SURFACE) {
-        eglQuerySurface(display, surface, EGL_WIDTH, &screenW);
-        eglQuerySurface(display, surface, EGL_HEIGHT, &screenH);
-    }
-    if (screenW <= 0 || screenH <= 0) return;
-
-    std::vector<PLModMenu_DrawCommand> cmds;
-    std::list<std::string> stringStore; // keep strings alive (std::list = stable addresses)
-
-    // Gather nearby actors (players).
-    std::vector<void*> actors;
-    bedrocktools::sdk::Vec3 extent = {30.0f, 30.0f, 30.0f};
-    ActorVec av = s_actorFetchNearby(m_localPlayerPtr, &extent, 1);
-    if (av.begin && av.end) {
-        for (DistanceSortedActor* it = av.begin; it < av.end; ++it) {
-            if (it->mActor) actors.push_back(it->mActor);
-        }
-    }
-    // Also consider the local player (for own bubbles in 3rd person).
-    if (m_showOwnBubbles) actors.push_back(m_localPlayerPtr);
-
-    for (void* actor : actors) {
-        if (s_actorIsPlayer && !s_actorIsPlayer(actor)) continue;
-
-        auto* player = reinterpret_cast<bedrocktools::sdk::Player*>(actor);
-        const std::string name = stripColors(player->name());
-        if (name.empty()) continue;
-
-        // Find this player's pending bubbles.
-        std::string foundKey;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_bubbles.find(name);
-            if (it != m_bubbles.end()) foundKey = name;
-            else {
-                const std::string norm = normalizeName(name);
-                for (const auto& kv : m_bubbles) {
-                    if (normalizeName(kv.first) == norm) { foundKey = kv.first; break; }
-                }
-            }
-        }
-        if (foundKey.empty()) continue;
-
-        // Anchor above the head.
-        bedrocktools::sdk::Vec3 anchor = player->position();
-        anchor.y += m_heightOffset;
-
-        float sx = 0.0f, sy = 0.0f;
-        if (!worldToScreen(camPos, yaw, pitch, anchor, m_fov, screenW, screenH, sx, sy)) continue;
-        if (sx < -200 || sx > screenW + 200 || sy < -200 || sy > screenH + 200) continue;
-
-        // Build the stacked text and draw one bubble per message.
-        std::vector<std::string> texts;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = m_bubbles.find(foundKey);
-            if (it == m_bubbles.end()) continue;
-            for (const auto& b : it->second) texts.push_back(stripColors(b.message));
-        }
-        if (texts.empty()) continue;
-
-        const float fontSize = 16.0f * m_scale;
-        const float padX = 8.0f * m_scale;
-        const float padY = 5.0f * m_scale;
-        const float lineGap = 2.0f * m_scale;
-
-        // Draw bottom-up so older messages stack upward.
-        float cursorY = sy;
-        for (auto it = texts.rbegin(); it != texts.rend(); ++it) {
-            const std::string& text = *it;
-            const float textW = calcTextWidth(text, fontSize);
-            const float boxW = textW + padX * 2.0f;
-            const float boxH = fontSize + padY * 2.0f;
-
-            // Background box (white).
-            PLModMenu_DrawCommand bg = {};
-            bg.type = PL_DRAW_RECT_FILLED;
-            bg.x = sx - boxW * 0.5f;
-            bg.y = cursorY - boxH;
-            bg.w = boxW;
-            bg.h = boxH;
-            bg.color = 0xF0FFFFFF; // near-opaque white
-            cmds.push_back(bg);
-
-            // Text (black).
-            stringStore.push_back(text);
-            PLModMenu_DrawCommand txt = {};
-            txt.type = PL_DRAW_TEXT;
-            txt.x = sx - textW * 0.5f;
-            txt.y = cursorY - boxH + padY;
-            txt.w = 0.0f;
-            txt.h = 0.0f;
-            txt.color = 0xFF000000; // black
-            txt.size = fontSize;
-            txt.text = stringStore.back().c_str();
-            cmds.push_back(txt);
-
-            cursorY -= (boxH + lineGap);
-        }
-    }
-
-    if (!cmds.empty()) submitDrawCommands(moduleId, cmds);
 }
 
 void BubbleChatModule::onInit() {
     uintptr_t textAddr = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ClientNetworkHandlerHandleText);
     if (textAddr) bedrocktools::hooks::install((void*)textAddr, (void*)handleTextHook, (void**)&originalHandleText);
 
+    uintptr_t ntAddr = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::Nametag);
+    if (ntAddr) m_nametagPatchTarget = (void*)(ntAddr + bedrocktools::sdk::offsets::NameTag::mExtractNameTagsPatchOffset);
+
     if (auto afn = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorFetchNearbyActorsSorted)) s_actorFetchNearby = (ActorFetchFn)afn;
     if (auto aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer)) s_actorIsPlayer = (ActorIsPlayerFn)aip;
+    if (auto snt = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorSetNameTag)) s_actorSetNameTag = (ActorSetNameTagFn)snt;
+
+    bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>([](const bedrocktools::events::LocalPlayerTickEvent& event) {
+        tickCallback(event.player);
+    });
+}
+
+void BubbleChatModule::applyBubbles(bool apply) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!apply) m_bubbles.clear();
+
+    if (m_bubbles.empty() && m_overrides.empty()) return;
+    if (!m_localPlayerPtr || !s_actorFetchNearby || !s_actorSetNameTag) return;
+
+    uintptr_t levelPtr = *(uintptr_t*)((uintptr_t)m_localPlayerPtr + bedrocktools::sdk::offsets::Actor::mLevel);
+    if (!levelPtr) return;
+    uintptr_t dimPtr = *(uintptr_t*)((uintptr_t)m_localPlayerPtr + bedrocktools::sdk::offsets::Actor::mDimension);
+    if (!dimPtr) return;
+
+    std::vector<void*> actors;
+    actors.push_back(m_localPlayerPtr);
+
+    bedrocktools::sdk::Vec3 extent = {30.0f, 30.0f, 30.0f};
+    ActorVec av = s_actorFetchNearby(m_localPlayerPtr, &extent, 1);
+    if (av.begin && av.end) {
+        for (DistanceSortedActor* it = av.begin; it < av.end; ++it) {
+            if (it->mActor && it->mActor != m_localPlayerPtr) actors.push_back(it->mActor);
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> normKeys;
+    for (auto& kv : m_bubbles) normKeys.push_back({normalizeName(kv.first), kv.first});
+
+    for (void* actor : actors) {
+        if (s_actorIsPlayer && !s_actorIsPlayer(actor)) continue;
+
+        uintptr_t addr = (uintptr_t)actor;
+        std::string* pName = (std::string*)(addr + bedrocktools::sdk::offsets::Player::mName);
+        std::string* pTag  = (std::string*)(addr + bedrocktools::sdk::offsets::Actor::mFilteredNameTag);
+
+        std::string n1 = (pName && !pName->empty()) ? *pName : "";
+        std::string n2 = (pTag  && !pTag->empty())  ? *pTag  : "";
+
+        std::string nn1 = normalizeName(n1);
+        std::string nn2 = normalizeName(n2);
+
+        auto ovIt = m_overrides.find(actor);
+        std::string original = (ovIt != m_overrides.end()) ? ovIt->second.original : "";
+
+        auto bIt = m_bubbles.end();
+        if (!original.empty()) bIt = m_bubbles.find(original);
+        if (bIt == m_bubbles.end()) { bIt = m_bubbles.find(n1); if (bIt != m_bubbles.end()) original = n1; }
+        if (bIt == m_bubbles.end()) { bIt = m_bubbles.find(n2); if (bIt != m_bubbles.end()) original = n2; }
+        if (bIt == m_bubbles.end()) {
+            for (auto& nk : normKeys) {
+                if (nk.first.length() < 3) continue;
+                if (nk.first == nn1 || nk.first == nn2 ||
+                    nn2.find(nk.first) != std::string::npos ||
+                    nn1.find(nk.first) != std::string::npos) {
+                    original = nk.second;
+                    bIt = m_bubbles.find(original);
+                    break;
+                }
+            }
+        }
+
+        if (bIt != m_bubbles.end()) {
+            std::string joined;
+            for (const auto& b : bIt->second) {
+                if (!joined.empty()) joined += "\n";
+                joined += wrapText("\xE2\x80\x94 " + b.message, 28);
+            }
+            std::string appliedStr;
+            if (m_msgAboveName) appliedStr = joined + "\n" + original;
+            else appliedStr = original + "\n" + joined;
+
+            if (n2 != appliedStr) {
+                s_actorSetNameTag(actor, &appliedStr);
+            }
+            m_overrides[actor] = {original, appliedStr};
+        } else if (ovIt != m_overrides.end()) {
+            if (n2 != ovIt->second.original) {
+                s_actorSetNameTag(actor, &ovIt->second.original);
+            }
+            m_overrides.erase(ovIt);
+        }
+    }
 }
